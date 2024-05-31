@@ -75,10 +75,10 @@ def main():
                     break
 
         # load the json file of the nifti
-        nifti_json = Path(nifti).with_suffix(".json")
-        if not nifti_json.exists():
-            raise ValueError(f"Could not find json file {nifti_json}.")
-        with open(nifti_json, "r") as f:
+        nifti_json_path = Path(nifti).with_suffix(".json")
+        if not nifti_json_path.exists():
+            raise ValueError(f"Could not find json file {nifti_json_path}.")
+        with open(nifti_json_path, "r") as f:
             metadata = json.load(f)
 
         # load the nifti file
@@ -109,7 +109,17 @@ def main():
         # convert these files to a numpy array
         print(f"Found {len(dat_files)} .dat files associated with {dicom}.")
         print("Converting .dat files to nifti...")
-        data_array = dat_to_array(dat_files, rshape)
+        try:
+            data_array = dat_to_array(dat_files, rshape)
+        except RuntimeError:
+            print("""
+            Check and see if you either have an extra .dcm file (indicative of an interrupted
+            run), or if any of your .dat or .dcm files are not the same size as its siblings 
+            (could signal corrupted data). Exiting...
+            """)
+            nifti_img_path.unlink()
+            nifti_json_path.unlink()
+            sys.exit(1)
 
         # check if number of frames in nifti matches number of frames in .dat files
         if data_array.shape[-1] != shape[-1]:
@@ -142,15 +152,15 @@ def main():
                         continue
                     # if not, then add it to the nifti name and rename the file
                     orig_img_path = nifti_img_path
-                    orig_json_path = nifti_json
+                    orig_json_path = nifti_json_path
                     if "_ph" in nifti.name:
                         nifti = Path(str(nifti).replace("_ph", "_e1_ph"))
                     else:
                         nifti = Path(str(nifti) + "_e1")
                     nifti_img_path = nifti.with_suffix(suffix)
-                    nifti_json = nifti.with_suffix(".json")
+                    nifti_json_path = nifti.with_suffix(".json")
                     shutil.move(orig_img_path, nifti_img_path)
-                    shutil.move(orig_json_path, nifti_json)
+                    shutil.move(orig_json_path, nifti_json_path)
                 # TODO: remove later if fixed
                 # resave the phase image with the dat data
                 if "_ph" in nifti.name:
