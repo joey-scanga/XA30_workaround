@@ -11,6 +11,8 @@ def dat_to_array(dat_files, shape):
 
         # convert to numpy array
         data = np.frombuffer(binary_data, dtype=np.uint16)
+        if len(data) == 0:
+            print(f"Dat File: {dat_path} contains no data! Has this file been corrupted?")
         try:
             data = data.reshape(*shape)
         except ValueError:
