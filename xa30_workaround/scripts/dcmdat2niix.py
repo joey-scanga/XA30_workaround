@@ -186,7 +186,7 @@ def main():
             output_path = output_base.with_suffix(suffix)
             nib.Nifti1Image(data_array[..., i, :], nifti_img.affine, nifti_img.header).to_filename(output_path)
             # save the json file
-            output_json = output_path.with_suffix(".json")
+            output_json = output_base.with_suffix(".json")
             with open(output_json, "w") as f:
                 json.dump(metadata_copy, f, indent=4)
     print("Done.")
