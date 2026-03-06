@@ -16,6 +16,154 @@ def normalize(data):
     return (data - np.min(data)) / (np.max(data) - np.min(data))
 
 
+
+def dcmdat2niix(session_nifti_dir: str, series_path: str):
+    # run dcm2niix
+    # f"dcmdat2niix -ba y -z o -w 1 -o {session_nifti_dir} {series_path}"
+    dicoms_nii_map = dicom2nifti(["-ba", "y", "-z", "o", "-w", "1", "-v", "1", "-o", session_nifti_dir, series_path])
+
+    # loop over each nifti file
+    for nifti in dicoms_nii_map:
+        # get the associated dicom file
+        dicom = dicoms_nii_map[nifti]
+
+        # search for alTE tag in dicom file header (this is not a DICOM tag so we need to search by text)
+        TEs = None
+        with open(dicom, "rb") as f:
+            # search for alTE and get the 8 next lines after
+            lines = f.readlines()
+            for i, line in enumerate(lines):
+                try:
+                    line = line.decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if "alTE" in line:
+                    TEs = np.array(
+                        [float(l.decode("utf-8").strip().split("= \t")[1]) / 1e6 for l in lines[i + 1 : i + 9]]
+                    )
+                    # only grab valid TEs
+                    diff = TEs[1:] - TEs[0:-1]
+                    TEs = np.insert(TEs[1:][diff > 0], 0, TEs[0])
+                    break
+
+        # load the json file of the nifti
+        nifti_json_path = Path(nifti).with_suffix(".json")
+        if not nifti_json_path.exists():
+            raise ValueError(f"Could not find json file {nifti_json_path}.")
+        with open(nifti_json_path, "r") as f:
+            metadata = json.load(f)
+
+        # load the nifti file
+        nifti_img_path = Path(nifti).with_suffix(".nii")
+        suffix = ".nii"
+        if not nifti_img_path.exists():
+            nifti_img_path = Path(nifti).with_suffix(".nii.gz")
+            suffix = ".nii.gz"
+            if not nifti_img_path.exists():
+                raise ValueError(f"Could not find nifti file {nifti_img_path}.")
+        nifti_img = nib.load(nifti_img_path)
+
+        # get the shape of the nifti file
+        shape = nifti_img.shape
+        if len(shape) == 3:
+            shape = tuple([*shape, 1])
+        rshape = list(shape[::-1])
+        rshape[0] = TEs.shape[0]  # we want # of TEs instead of frames
+
+        # now search for .dat files that neighbor the exemplar dicom file
+        dat_files = list(dicom.parent.glob("*.dat"))
+
+        # if no .dat files were found, then skip this nifti
+        if len(dat_files) == 0:
+            print(f"Could not find any .dat files associated with {dicom}.")
+            continue
+
+        # convert these files to a numpy array
+        print(f"Found {len(dat_files)} .dat files associated with {dicom}.")
+        print("Converting .dat files to nifti...")
+        try:
+            data_array = dat_to_array(dat_files, rshape)
+        except RuntimeError:
+            print("""
+            Check and see if you either have an extra .dcm file (indicative of an interrupted
+            run), or if any of your .dat or .dcm files are not the same size as its siblings 
+            (could signal corrupted data). Exiting...
+            """)
+            nifti_img_path.unlink()
+            nifti_json_path.unlink()
+            sys.exit(1)
+
+        # check if number of frames in nifti matches number of frames in .dat files
+        if data_array.shape[-1] != shape[-1]:
+            raise ValueError("The number of frames in the .dat files does not match the number of frames in the nifti.")
+
+        # do first echo, first frame sanity check
+        if len(nifti_img.dataobj.shape) == 3:
+            if not np.all(np.isclose(normalize(data_array[..., 0, 0].astype("f8")), normalize(nifti_img.dataobj[...]))):
+                raise ValueError(
+                    "Sanity check failed. The first echo, first frame of the .dat files does not match the nifti."
+                )
+        else:
+            if not np.all(np.isclose(normalize(data_array[..., 0, 0].astype("f8")), normalize(nifti_img.dataobj[..., 0]))):
+                raise ValueError(
+                    "Sanity check failed. The first echo, first frame of the .dat files does not match the nifti."
+                )
+
+        # loop over each echo skipping the first one
+        # only renaming if neccessary
+        print("Saving nifti files...")
+        nifti = Path(nifti)
+        echo_prefix = "e"
+        for i, t in enumerate(TEs):
+            if i == 0:
+                # check if e1 is in the filename
+                if "e1" not in nifti.name:
+                    # skip if echo1 is in filename
+                    if "echo1" in nifti.name:
+                        echo_prefix = "echo"
+                        continue
+                    # if not, then add it to the nifti name and rename the file
+                    orig_img_path = nifti_img_path
+                    orig_json_path = nifti_json_path
+                    if "_ph" in nifti.name:
+                        nifti = Path(str(nifti).replace("_ph", "_e1_ph"))
+                    else:
+                        nifti = Path(str(nifti) + "_e1")
+                    nifti_img_path = nifti.with_suffix(suffix)
+                    nifti_json_path = nifti.with_suffix(".json")
+                    shutil.move(orig_img_path, nifti_img_path)
+                    shutil.move(orig_json_path, nifti_json_path)
+                # TODO: remove later if fixed
+                # resave the phase image with the dat data
+                if "_ph" in nifti.name:
+                    nib.Nifti1Image(data_array[..., 0, :], nifti_img.affine, nifti_img.header).to_filename(
+                        nifti_img_path
+                    )
+                continue
+            # substitute the echo in output_filename
+            output_base = Path(str(nifti).replace(f"{echo_prefix}1", f"{echo_prefix}{i + 1}"))
+            # copy the metadata
+            metadata_copy = metadata.copy()
+            # replace the echo time
+            metadata_copy["EchoTime"] = t
+            # replace the ConversionSoftware
+            metadata_copy["ConversionSoftware"] = "dcmdat2niix"
+            # set the proper TE type in ImageTypeText
+            try:
+                te_idx = [t for t in range(len(metadata_copy["ImageTypeText"])) if 'TE' in metadata_copy["ImageTypeText"][t]][0]
+                metadata_copy["ImageTypeText"][te_idx] = f"TE{str(i + 1)}"
+            except IndexError:
+                pass
+            # save the nifti file
+            output_path = output_base.with_suffix(suffix)
+            nib.Nifti1Image(data_array[..., i, :], nifti_img.affine, nifti_img.header).to_filename(output_path)
+            # save the json file
+            output_json = output_path.with_suffix(".json")
+            with open(output_json, "w") as f:
+                json.dump(metadata_copy, f, indent=4)
+    print("Done.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert DICOM and .dat to NIFTI", add_help=False)
     parser.add_argument("-h", "--help", action="store_true")
